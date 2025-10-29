@@ -1,0 +1,172 @@
+// server.js
+const express = require('express');
+const multer = require('multer');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+const fs = require('fs');
+const path = require('path');
+const { Low, JSONFile } = require('lowdb');
+const { nanoid } = require('nanoid');
+
+const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
+const SECRET = 'replace_this_with_strong_secret'; // production -> env var
+const PORT = process.env.PORT || 3000;
+
+// LowDB setup (file DB)
+const adapter = new JSONFile(path.join(__dirname, 'data', 'db.json'));
+const db = new Low(adapter);
+
+async function initDB(){
+  await db.read();
+  db.data = db.data || { users: [], files: [] };
+  await db.write();
+}
+initDB();
+
+// multer for uploads (store in uploads/)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
+  filename: (req, file, cb) => {
+    const id = nanoid(10);
+    const ext = path.extname(file.originalname);
+    cb(null, `${id}${ext}`);
+  }
+});
+const upload = multer({ storage });
+
+// Auth helpers
+function genToken(user){
+  // keep minimal info
+  return jwt.sign({ id: user.id, email: user.email, role: user.role }, SECRET, { expiresIn: '2h' });
+}
+function authMiddleware(req, res, next){
+  const auth = req.headers.authorization;
+  if(!auth) return res.status(401).json({ error: 'Missing authorization header' });
+  const m = auth.match(/^Bearer (.+)$/);
+  if(!m) return res.status(401).json({ error: 'Invalid authorization format' });
+  const token = m[1];
+  try{
+    const payload = jwt.verify(token, SECRET);
+    req.user = payload;
+    next();
+  }catch(e){
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// Routes
+
+// Register
+app.post('/api/register', async (req, res) => {
+  const { name, email, password, role } = req.body;
+  if(!email || !password || !role) return res.status(400).json({ error: 'email, password, role required' });
+  await db.read();
+  const exists = db.data.users.find(u => u.email === email);
+  if(exists) return res.status(400).json({ error: 'Email already exists' });
+  const hashed = await bcrypt.hash(password, 10);
+  const user = { id: nanoid(8), name: name || '', email, password: hashed, role };
+  db.data.users.push(user);
+  await db.write();
+  const token = genToken(user);
+  res.json({ token, user: { id: user.id, email: user.email, role: user.role, name: user.name } });
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  await db.read();
+  const user = db.data.users.find(u => u.email === email);
+  if(!user) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password, user.password);
+  if(!ok) return res.status(400).json({ error: 'Invalid credentials' });
+  const token = genToken(user);
+  res.json({ token, user: { id: user.id, email: user.email, role: user.role, name: user.name } });
+});
+
+// Upload PDF (teacher only)
+app.post('/api/upload', authMiddleware, upload.single('pdf'), async (req, res) => {
+  if(req.user.role !== 'teacher') return res.status(403).json({ error: 'Only teachers can upload' });
+  const file = req.file;
+  if(!file) return res.status(400).json({ error: 'No file uploaded' });
+  // store metadata
+  await db.read();
+  const entry = {
+    id: nanoid(10),
+    filename: file.filename,
+    originalName: file.originalname,
+    uploaderId: req.user.id,
+    uploadedAt: new Date().toISOString()
+  };
+  db.data.files.push(entry);
+  await db.write();
+  res.json({ ok: true, file: entry });
+});
+
+// List files (students & teachers)
+app.get('/api/files', authMiddleware, async (req, res) => {
+  await db.read();
+  // optionally filter by role or fine-grained permissions
+  res.json({ files: db.data.files.map(f => ({ id: f.id, originalName: f.originalName, uploadedAt: f.uploadedAt })) });
+});
+
+// Get PDF with watermarking (secured)
+// Client must call this with Authorization: Bearer <token>
+app.get('/api/pdf/:id', authMiddleware, async (req, res) => {
+  const fileId = req.params.id;
+  await db.read();
+  const entry = db.data.files.find(f => f.id === fileId);
+  if(!entry) return res.status(404).json({ error: 'File not found' });
+
+  const filePath = path.join(__dirname, 'uploads', entry.filename);
+  if(!fs.existsSync(filePath)) return res.status(404).json({ error: 'File missing on server' });
+
+  // Read original PDF and add watermark (user email + timestamp)
+  try{
+    const pdfBytes = fs.readFileSync(filePath);
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+
+    const pages = pdfDoc.getPages();
+    const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const watermarkText = `${req.user.email} - ${new Date().toLocaleString()}`;
+
+    pages.forEach((page, idx) => {
+      const { width, height } = page.getSize();
+      page.drawText(watermarkText, {
+        x: 30,
+        y: 20,
+        size: 8,
+        font: helveticaFont,
+        color: rgb(0.5, 0.5, 0.5),
+        opacity: 0.6,
+      });
+      // optional diagonal watermark middle of page:
+      page.drawText(watermarkText, {
+        x: width / 4,
+        y: height / 2,
+        size: 36,
+        font: helveticaFont,
+        color: rgb(0.8, 0.8, 0.8),
+        rotate: { type: 'degrees', angle: -45 },
+        opacity: 0.08
+      });
+    });
+
+    const modifiedPdfBytes = await pdfDoc.save();
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${entry.originalName}"`);
+    res.send(Buffer.from(modifiedPdfBytes));
+  }catch(err){
+    console.error(err);
+    res.status(500).json({ error: 'Failed to prepare PDF' });
+  }
+});
+
+// Simple health
+app.get('/api/ping', (req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
